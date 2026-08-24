@@ -36,7 +36,7 @@ def health():
     return {
         "status": "healthy",
         "connectors": {
-            "shopify_webhook": "configured" if os.getenv("SHOPIFY_WEBHOOK_SECRET") else "demo_mode",
+            "shopify_webhook": "configured" if (os.getenv("SHOPIFY_WEBHOOK_SECRET") or os.getenv("SHOPIFY_CLIENT_SECRET")) else "demo_mode",
             "shopify_admin_api": "configured" if shopify.configured else "not_configured",
             "erp": "configured" if os.getenv("ERP_BASE_URL") else "simulator",
         },
@@ -53,7 +53,7 @@ async def receive_real_shopify_order(
     x_shopify_topic: str = Header(default="orders/create"),
 ):
     raw_body = await request.body()
-    secret = os.getenv("SHOPIFY_WEBHOOK_SECRET")
+    secret = os.getenv("SHOPIFY_WEBHOOK_SECRET") or os.getenv("SHOPIFY_CLIENT_SECRET")
     if not secret:
         raise HTTPException(status_code=503, detail="SHOPIFY_WEBHOOK_SECRET is not configured")
     if not verify_shopify_hmac(raw_body, x_shopify_hmac_sha256, secret):
@@ -89,6 +89,33 @@ def receive_demo_shopify_order(
     if queued.status != "duplicate":
         background_tasks.add_task(service.process_event, queued.event_id)
     return queued
+
+
+@app.post("/shopify/setup/webhook")
+def setup_shopify_webhook():
+    if not shopify.configured:
+        raise HTTPException(status_code=503, detail="Set SHOPIFY_SHOP_DOMAIN and Shopify app credentials first")
+    public_url = (os.getenv("COMMERCEBRIDGE_PUBLIC_URL") or "").rstrip("/")
+    if not public_url.startswith("https://"):
+        raise HTTPException(status_code=503, detail="COMMERCEBRIDGE_PUBLIC_URL must be a public HTTPS URL")
+    try:
+        subscription = shopify.register_orders_create_webhook(
+            f"{public_url}/webhooks/shopify/orders/create"
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Shopify webhook registration failed: {exc}") from exc
+    return {"registered": True, "subscription": subscription}
+
+
+@app.post("/shopify/demo-order")
+def create_real_shopify_demo_order():
+    if not shopify.configured:
+        raise HTTPException(status_code=503, detail="Shopify Admin API is not configured")
+    try:
+        order = shopify.create_demo_order()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Shopify order creation failed: {exc}") from exc
+    return {"created": True, "order": order, "message": "Shopify created the order; wait for the signed ORDERS_CREATE webhook."}
 
 
 @app.post("/reconcile/shopify", response_model=ReconciliationResult)
