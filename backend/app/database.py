@@ -30,11 +30,25 @@ class Database:
               payload TEXT NOT NULL,
               canonical_payload TEXT,
               error TEXT,
+              shop_domain TEXT,
+              topic TEXT,
+              erp_reference TEXT,
+              processing_ms INTEGER,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(integration_events)")}
+        for name, sql_type in {
+            "shop_domain": "TEXT",
+            "topic": "TEXT",
+            "erp_reference": "TEXT",
+            "processing_ms": "INTEGER",
+        }.items():
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE integration_events ADD COLUMN {name} {sql_type}")
+
         self.connection.executemany(
             "INSERT OR IGNORE INTO product_mappings VALUES (?, ?, ?)",
             [
@@ -46,9 +60,10 @@ class Database:
         self.connection.commit()
 
     def mapping_for(self, external_sku: str):
-        return self.connection.execute(
-            "SELECT * FROM product_mappings WHERE external_sku = ?", (external_sku,)
-        ).fetchone()
+        return self.connection.execute("SELECT * FROM product_mappings WHERE external_sku = ?", (external_sku,)).fetchone()
+
+    def list_mappings(self):
+        return self.connection.execute("SELECT * FROM product_mappings ORDER BY external_sku").fetchall()
 
     def upsert_mapping(self, external_sku: str, erp_sku: str, product_name: str) -> None:
         self.connection.execute(
@@ -60,33 +75,32 @@ class Database:
         self.connection.commit()
 
     def event_by_key(self, key: str):
-        return self.connection.execute(
-            "SELECT * FROM integration_events WHERE idempotency_key = ?", (key,)
-        ).fetchone()
+        return self.connection.execute("SELECT * FROM integration_events WHERE idempotency_key = ?", (key,)).fetchone()
+
+    def event_by_order_id(self, source_order_id: str):
+        return self.connection.execute("SELECT * FROM integration_events WHERE source_order_id = ? ORDER BY rowid DESC LIMIT 1", (source_order_id,)).fetchone()
 
     def event_by_id(self, event_id: str):
-        return self.connection.execute(
-            "SELECT * FROM integration_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
+        return self.connection.execute("SELECT * FROM integration_events WHERE event_id = ?", (event_id,)).fetchone()
 
-    def create_event(self, event_id: str, key: str, source_order_id: str, payload: dict) -> None:
+    def create_event(self, event_id: str, key: str, source_order_id: str, payload: dict, *, shop_domain=None, topic="orders/create") -> None:
         self.connection.execute(
             """INSERT INTO integration_events
-               (event_id, idempotency_key, source, source_order_id, status, payload)
-               VALUES (?, ?, 'shopify', ?, 'processing', ?)""",
-            (event_id, key, source_order_id, json.dumps(payload, default=str)),
+               (event_id, idempotency_key, source, source_order_id, status, payload, shop_domain, topic)
+               VALUES (?, ?, 'shopify', ?, 'queued', ?, ?, ?)""",
+            (event_id, key, source_order_id, json.dumps(payload, default=str), shop_domain, topic),
         )
         self.connection.commit()
 
-    def update_event(self, event_id: str, *, status: str, attempts: int, error=None, canonical=None) -> None:
+    def update_event(self, event_id: str, *, status: str, attempts: int, error=None, canonical=None, erp_reference=None, processing_ms=None) -> None:
         self.connection.execute(
-            """UPDATE integration_events SET status=?, attempts=?, error=?,
-               canonical_payload=?, updated_at=CURRENT_TIMESTAMP WHERE event_id=?""",
-            (status, attempts, error, json.dumps(canonical, default=str) if canonical else None, event_id),
+            """UPDATE integration_events SET status=?, attempts=?, error=?, canonical_payload=?,
+               erp_reference=?, processing_ms=?, updated_at=CURRENT_TIMESTAMP WHERE event_id=?""",
+            (status, attempts, error, json.dumps(canonical, default=str) if canonical else None, erp_reference, processing_ms, event_id),
         )
         self.connection.commit()
 
-    def list_events(self):
+    def list_events(self, limit: int = 100):
         return self.connection.execute(
-            "SELECT * FROM integration_events ORDER BY created_at DESC, rowid DESC"
+            "SELECT * FROM integration_events ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
         ).fetchall()
