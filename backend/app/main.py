@@ -176,4 +176,7 @@ def retry_event(event_id: str):
 
 @app.get("/events")
 def list_events(limit: int = 100):
-    return [dict(row) for row in database.list_events(min(max(limit, 1), 500))]
+    rows = [dict(row) for row in database.list_events(min(max(limit, 1), 500))]
+    # Keep synthetic Swagger placeholder rows in SQLite for audit history,
+    # but don't let a schema-generated `"string"` order pollute the live demo feed.
+    return [row for row in rows if row.get("source_order_id") != "string"]
