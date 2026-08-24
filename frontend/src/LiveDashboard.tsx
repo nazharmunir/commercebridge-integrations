@@ -99,6 +99,18 @@ export default function LiveDashboard() {
     finally { setBusy(false); }
   }
 
+  async function createRealShopifyOrder() {
+    setBusy(true);
+    try {
+      const response = await fetch(`${API_URL}/shopify/demo-order`, { method: "POST" });
+      const body = await response.json(); if (!response.ok) throw new Error(body.detail || "Shopify order creation failed");
+      const name = body.order?.name || body.order?.id || "test order";
+      notify(`${name} created inside Shopify — waiting for Shopify's signed webhook.`);
+      setTimeout(() => refresh(), 800); setTimeout(() => refresh(), 2200); setTimeout(() => refresh(), 5000);
+    } catch (error) { notify(error instanceof Error ? error.message : "Shopify order creation failed"); }
+    finally { setBusy(false); }
+  }
+
   function openTrace(row: any) { if (!row.event) return; setSelected(row); setDialog("trace"); }
   function openMapping() {
     if (!review) return notify("Run the unknown-SKU scenario first.");
@@ -133,7 +145,7 @@ export default function LiveDashboard() {
     </aside>
 
     <section className="workspace">
-      <header className="topbar"><div><p className="eyebrow">SHOPIFY → ERP</p><h1>Live operations</h1></div><div className="top-actions"><button className="secondary-button" disabled={busy} onClick={reconcile}>Reconcile Shopify</button><button className="primary-button" disabled={busy} onClick={() => setDialog("scenarios")}>Run scenario <span>→</span></button></div></header>
+      <header className="topbar"><div><p className="eyebrow">SHOPIFY → ERP</p><h1>Live operations</h1></div><div className="top-actions">{shopifyApi === "configured" && <button className="secondary-button" disabled={busy} onClick={createRealShopifyOrder}>Create real Shopify order</button>}<button className="secondary-button" disabled={busy} onClick={reconcile}>Reconcile Shopify</button><button className="primary-button" disabled={busy} onClick={() => setDialog("scenarios")}>Run scenario <span>→</span></button></div></header>
       <div className="notice-bar"><span className="live-pulse" />{online ? "Backend live · verified webhook pipeline ready" : "Presentation fallback · point VITE_API_URL at FastAPI for live events"}<small>{online ? API_URL : "Static rows shown safely"}</small></div>
 
       <section className="metric-grid">
