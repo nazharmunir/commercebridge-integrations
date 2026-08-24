@@ -86,11 +86,14 @@ class ShopifyAdminClient:
             },
             timeout=10.0,
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise RuntimeError(
+                f"Shopify token exchange failed ({response.status_code}): {response.text}"
+            )
         payload = response.json()
         token = payload.get("access_token")
         if not token:
-            raise RuntimeError("Shopify did not return an access token")
+            raise RuntimeError(f"Shopify did not return an access token: {payload}")
         self._cached_token = token
         self._token_expires_at = time.time() + int(payload.get("expires_in") or 86399)
         return token
@@ -103,7 +106,10 @@ class ShopifyAdminClient:
             json={"query": query, "variables": variables or {}},
             timeout=10.0,
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise RuntimeError(
+                f"Shopify GraphQL request failed ({response.status_code}): {response.text}"
+            )
         payload = response.json()
         if payload.get("errors"):
             raise RuntimeError(json.dumps(payload["errors"]))
