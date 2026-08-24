@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from decimal import Decimal
 
 import httpx
@@ -51,15 +52,129 @@ class ShopifyAdminClient:
         self,
         shop_domain: str | None = None,
         access_token: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
         api_version: str | None = None,
     ) -> None:
         self.shop_domain = (shop_domain or os.getenv("SHOPIFY_SHOP_DOMAIN") or "").replace("https://", "").rstrip("/")
         self.access_token = access_token or os.getenv("SHOPIFY_ACCESS_TOKEN")
+        self.client_id = client_id or os.getenv("SHOPIFY_CLIENT_ID")
+        self.client_secret = client_secret or os.getenv("SHOPIFY_CLIENT_SECRET")
         self.api_version = api_version or os.getenv("SHOPIFY_API_VERSION", "2026-07")
+        self._cached_token: str | None = None
+        self._token_expires_at = 0.0
 
     @property
     def configured(self) -> bool:
-        return bool(self.shop_domain and self.access_token)
+        return bool(self.shop_domain and (self.access_token or (self.client_id and self.client_secret)))
+
+    def _get_access_token(self) -> str:
+        if self.access_token:
+            return self.access_token
+        if not (self.shop_domain and self.client_id and self.client_secret):
+            raise RuntimeError("Shopify Admin API is not configured")
+        if self._cached_token and time.time() < self._token_expires_at - 60:
+            return self._cached_token
+
+        response = httpx.post(
+            f"https://{self.shop_domain}/admin/oauth/access_token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get("access_token")
+        if not token:
+            raise RuntimeError("Shopify did not return an access token")
+        self._cached_token = token
+        self._token_expires_at = time.time() + int(payload.get("expires_in") or 86399)
+        return token
+
+    def _graphql(self, query: str, variables: dict | None = None) -> dict:
+        token = self._get_access_token()
+        response = httpx.post(
+            f"https://{self.shop_domain}/admin/api/{self.api_version}/graphql.json",
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+            json={"query": query, "variables": variables or {}},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            raise RuntimeError(json.dumps(payload["errors"]))
+        return payload.get("data") or {}
+
+    def register_orders_create_webhook(self, callback_url: str) -> dict:
+        query = """
+        mutation RegisterOrdersCreate($topic: WebhookSubscriptionTopic!, $subscription: WebhookSubscriptionInput!) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $subscription) {
+            webhookSubscription { id topic uri }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self._graphql(
+            query,
+            {
+                "topic": "ORDERS_CREATE",
+                "subscription": {"uri": callback_url},
+            },
+        )
+        result = data.get("webhookSubscriptionCreate") or {}
+        errors = result.get("userErrors") or []
+        if errors:
+            raise RuntimeError(json.dumps(errors))
+        return result.get("webhookSubscription") or {}
+
+    def create_demo_order(
+        self,
+        *,
+        sku: str = "COSRX-SNL-100",
+        title: str = "COSRX Snail Essence 100ml",
+        quantity: int = 2,
+        unit_price: Decimal = Decimal("24.90"),
+        currency: str = "EUR",
+    ) -> dict:
+        query = """
+        mutation CreateCommerceBridgeDemoOrder($order: OrderCreateOrderInput!) {
+          orderCreate(order: $order) {
+            order { id name createdAt }
+            userErrors { field message }
+          }
+        }
+        """
+        variables = {
+            "order": {
+                "currency": currency,
+                "email": "commercebridge-demo@example.com",
+                "financialStatus": "PAID",
+                "lineItems": [
+                    {
+                        "sku": sku,
+                        "title": title,
+                        "quantity": quantity,
+                        "priceSet": {
+                            "shopMoney": {
+                                "amount": str(unit_price),
+                                "currencyCode": currency,
+                            }
+                        },
+                    }
+                ],
+                "note": "Created by CommerceBridge integration demo",
+            }
+        }
+        data = self._graphql(query, variables)
+        result = data.get("orderCreate") or {}
+        errors = result.get("userErrors") or []
+        if errors:
+            raise RuntimeError(json.dumps(errors))
+        return result.get("order") or {}
 
     def list_recent_orders(self, first: int = 25) -> list[ShopifyOrder]:
         if not self.configured:
@@ -86,19 +201,10 @@ class ShopifyAdminClient:
           }
         }
         """
-        response = httpx.post(
-            f"https://{self.shop_domain}/admin/api/{self.api_version}/graphql.json",
-            headers={"X-Shopify-Access-Token": self.access_token, "Content-Type": "application/json"},
-            json={"query": query, "variables": {"first": first}},
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errors"):
-            raise RuntimeError(json.dumps(payload["errors"]))
+        payload = self._graphql(query, {"first": first})
 
         orders = []
-        for node in payload["data"]["orders"]["nodes"]:
+        for node in (payload.get("orders") or {}).get("nodes") or []:
             customer = node.get("customer") or {}
             name = " ".join(filter(None, [customer.get("firstName"), customer.get("lastName")])).strip() or "Shopify customer"
             money = (node.get("totalPriceSet") or {}).get("shopMoney") or {}
